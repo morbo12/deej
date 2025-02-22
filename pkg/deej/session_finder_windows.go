@@ -4,12 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"syscall"
 	"time"
 	"unsafe"
 
 	ole "github.com/go-ole/go-ole"
-	wca "github.com/moutend/go-wca"
+	wca "github.com/moutend/go-wca/pkg/wca"
 	"go.uber.org/zap"
 )
 
@@ -40,7 +39,32 @@ const (
 
 	// prefix for device sessions in logger
 	deviceSessionFormat = "device.%s"
+	// COM success code
+	S_OK = 0x00000000
 )
+
+// Create a helper function to handle the default device change
+func (sf *wcaSessionFinder) handleDefaultDeviceChanged(flow wca.EDataFlow, role wca.ERole, deviceId string) error {
+	// filter out calls that happen in rapid succession
+	now := time.Now()
+
+	if sf.lastDefaultDeviceChange.Add(minDefaultDeviceChangeThreshold).After(now) {
+		return nil
+	}
+
+	sf.lastDefaultDeviceChange = now
+
+	sf.logger.Debug("Default audio device changed, marking master sessions as stale")
+	if sf.masterOut != nil {
+		sf.masterOut.markAsStale()
+	}
+
+	if sf.masterIn != nil {
+		sf.masterIn.markAsStale()
+	}
+
+	return nil
+}
 
 func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 	sf := &wcaSessionFinder{
@@ -199,19 +223,16 @@ func (sf *wcaSessionFinder) getDefaultAudioEndpoints() (*wca.IMMDevice, *wca.IMM
 }
 
 func (sf *wcaSessionFinder) registerDefaultDeviceChangeCallback() error {
-	sf.mmNotificationClient = &wca.IMMNotificationClient{}
-	sf.mmNotificationClient.VTable = &wca.IMMNotificationClientVtbl{}
+	callback := wca.IMMNotificationClientCallback{
+		OnDefaultDeviceChanged: sf.handleDefaultDeviceChanged,
+		// Implement other callbacks as no-ops
+		OnDeviceAdded:          func(pwstrDeviceId string) error { return nil },
+		OnDeviceRemoved:        func(pwstrDeviceId string) error { return nil },
+		OnDeviceStateChanged:   func(pwstrDeviceId string, dwNewState uint64) error { return nil },
+		OnPropertyValueChanged: func(pwstrDeviceId string, key uint64) error { return nil },
+	}
 
-	// fill the VTable with noops, except for OnDefaultDeviceChanged. that one's gold
-	sf.mmNotificationClient.VTable.QueryInterface = syscall.NewCallback(sf.noopCallback)
-	sf.mmNotificationClient.VTable.AddRef = syscall.NewCallback(sf.noopCallback)
-	sf.mmNotificationClient.VTable.Release = syscall.NewCallback(sf.noopCallback)
-	sf.mmNotificationClient.VTable.OnDeviceStateChanged = syscall.NewCallback(sf.noopCallback)
-	sf.mmNotificationClient.VTable.OnDeviceAdded = syscall.NewCallback(sf.noopCallback)
-	sf.mmNotificationClient.VTable.OnDeviceRemoved = syscall.NewCallback(sf.noopCallback)
-	sf.mmNotificationClient.VTable.OnPropertyValueChanged = syscall.NewCallback(sf.noopCallback)
-
-	sf.mmNotificationClient.VTable.OnDefaultDeviceChanged = syscall.NewCallback(sf.defaultDeviceChangedCallback)
+	sf.mmNotificationClient = wca.NewIMMNotificationClient(callback)
 
 	if err := sf.mmDeviceEnumerator.RegisterEndpointNotificationCallback(sf.mmNotificationClient); err != nil {
 		sf.logger.Warnw("Failed to call RegisterEndpointNotificationCallback", "error", err)
